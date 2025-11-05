@@ -1,0 +1,23 @@
+{
+  "name": "vercel-vertex-ai-gateway",
+  "version": "1.0.0",
+  "description": "Vercel-based Vertex AI proxy gateway for OpenAI-compatible API",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "@google-cloud/aiplatform": "^5.1.0",
+    "next": "^14.2.3",
+    "react": "^18",
+    "react-dom": "^18"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "@types/react": "^18",
+    "@types/react-dom": "^18",
+    "typescript": "^5"
+  }
+}
