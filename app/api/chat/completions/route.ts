@@ -1,66 +1,121 @@
+// 文件路径: app/api/chat/completions/route.ts
+
 import { NextRequest, NextResponse } from 'next/server';
-import { VertexAIClient } from '@/lib/vertex-ai-client';
-import { convertVertexAIToOpenAI } from '@/lib/format-converter';
+import { VertexAI, HarmCategory, HarmBlockThreshold } from '@google-cloud/aiplatform';
 
-export const runtime = 'nodejs'; // Vercel 推荐 Edge Runtime 以获得最佳性能
+// 关键：将 API 路由的运行时设置为 Node.js
+// Vercel 会自动处理这个环境
+export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
 
-// API 密钥验证函数
-function validateApiKey(authHeader: string | null, validKeys: string[]): boolean {
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return false;
-  }
-  const apiKey = authHeader.substring(7).trim();
-  return validKeys.includes(apiKey);
+// 从环境变量中获取配置
+const {
+  GCP_PROJECT_ID,
+  GCP_LOCATION,
+  GEMINI_MODEL,
+  PRIVATE_API_KEYS,
+  GOOGLE_APPLICATION_CREDENTIALS_JSON
+} = process.env;
+
+// 检查必要的环境变量是否存在
+if (!GCP_PROJECT_ID || !GCP_LOCATION || !GEMINI_MODEL || !PRIVATE_API_KEYS || !GOOGLE_APPLICATION_CREDENTIALS_JSON) {
+  throw new Error("Missing required environment variables for Vertex AI API.");
 }
 
-export async function POST(request: NextRequest) {
-  try {
-    // 步骤 1: 验证 API 密钥
-    const authHeader = request.headers.get('Authorization');
-    const validKeys = (process.env.PRIVATE_API_KEYS || '').split(',').map(k => k.trim()).filter(Boolean);
-    if (validKeys.length > 0 && !validateApiKey(authHeader, validKeys)) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-    }
+// 将逗号分隔的 API 密钥字符串转换为 Set 以便快速查找
+const authorizedKeys = new Set(PRIVATE_API_KEYS.split(',').map(key => key.trim()));
 
-    // 步骤 2: 验证和获取环境变量
-    const { GCP_PROJECT_ID, GCP_LOCATION, GOOGLE_APPLICATION_CREDENTIALS_JSON, GEMINI_MODEL } = process.env;
-    if (!GCP_PROJECT_ID || !GCP_LOCATION || !GOOGLE_APPLICATION_CREDENTIALS_JSON || !GEMINI_MODEL) {
-      return NextResponse.json({ error: 'Server configuration error' }, { status: 500 });
-    }
+// 初始化 Vertex AI 客户端
+// 注意：当 GOOGLE_APPLICATION_CREDENTIALS_JSON 存在时，
+// SDK 会自动使用它，无需手动解析。
+const vertexAI = new VertexAI({
+  project: GCP_PROJECT_ID,
+  location: GCP_LOCATION,
+});
 
-    // 步骤 3: 解析请求体
-    const openaiRequest = await request.json();
-    if (!openaiRequest.messages) {
-      return NextResponse.json({ error: 'Invalid request body' }, { status: 400 });
-    }
+const generativeModel = vertexAI.getGenerativeModel({
+  model: GEMINI_MODEL,
+  // 根据需要配置安全设置
+  safetySettings: [
+    { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
+    { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
+  ],
+});
 
-    // 步骤 4: 创建客户端并处理请求
-    const vertexClient = new VertexAIClient(GCP_PROJECT_ID, GCP_LOCATION, GEMINI_MODEL);
-    const vertexResponse = await vertexClient.handleRequest(openaiRequest);
 
-    // 步骤 5: 如果是非流式，转换最终响应
-    if (openaiRequest.stream !== true) {
-        const responseData = await vertexResponse.json();
-        const openaiResponse = convertVertexAIToOpenAI(responseData, GEMINI_MODEL);
-        return NextResponse.json(openaiResponse);
-    }
-    
-    // 步骤 6: 如果是流式，直接返回转换后的流
-    return vertexResponse;
-
-  } catch (error) {
-    console.error('API error:', error);
-    const message = error instanceof Error ? error.message : 'Unknown internal server error';
-    return NextResponse.json({ error: message }, { status: 500 });
-  }
-}
-
-// 健康检查 GET 方法
-export async function GET() {
+// GET 请求处理程序，用于健康检查
+export async function GET(req: NextRequest) {
   return NextResponse.json({
     status: 'ok',
-    service: 'Vercel Vertex AI Gateway',
-    model: process.env.GEMINI_MODEL || 'not-configured',
-    gcp_project_id: process.env.GCP_PROJECT_ID || 'not-configured',
+    message: 'Vertex AI Gateway is running.',
+    model: GEMINI_MODEL,
+    instructions: 'Send a POST request to this endpoint with OpenAI-compatible JSON body.',
   });
+}
+
+// POST 请求处理程序，用于处理聊天请求
+export async function POST(req: NextRequest) {
+  // 1. 验证 API 密钥
+  const authHeader = req.headers.get('Authorization');
+  const apiKey = authHeader?.split(' ')[1]; // 从 "Bearer <key>" 中提取 key
+
+  if (!apiKey || !authorizedKeys.has(apiKey)) {
+    return NextResponse.json({ error: 'Unauthorized: Invalid or missing API key.' }, { status: 401 });
+  }
+
+  try {
+    // 2. 解析请求体
+    const body = await req.json();
+    const messages = body.messages || [];
+    const lastUserMessage = messages.filter((msg: any) => msg.role === 'user').pop();
+
+    if (!lastUserMessage || !lastUserMessage.content) {
+      return NextResponse.json({ error: 'No user message found.' }, { status: 400 });
+    }
+
+    // 3. 调用 Vertex AI
+    const chat = generativeModel.startChat({});
+    const stream = await chat.sendMessageStream(lastUserMessage.content);
+
+    // 4. 将 Vertex AI 的流转换为 OpenAI 格式的 Server-Sent Events (SSE) 流
+    const transformStream = new TransformStream({
+      async transform(chunk, controller) {
+        // 构建符合 OpenAI SSE 格式的数据块
+        const openaiChunk = {
+          id: `chatcmpl-${Date.now()}`,
+          object: 'chat.completion.chunk',
+          created: Math.floor(Date.now() / 1000),
+          model: GEMINI_MODEL,
+          choices: [
+            {
+              index: 0,
+              delta: {
+                content: chunk.candidates?.[0]?.content?.parts?.[0]?.text || '',
+              },
+              finish_reason: chunk.candidates?.[0]?.finishReason === 'STOP' ? 'stop' : null,
+            },
+          ],
+        };
+        controller.enqueue(`data: ${JSON.stringify(openaiChunk)}\n\n`);
+      },
+      flush(controller) {
+        // 流结束时，发送一个 [DONE] 标记
+        controller.enqueue('data: [DONE]\n\n');
+      }
+    });
+
+    // 返回一个流式响应
+    return new Response(stream.stream.pipeThrough(transformStream), {
+      headers: {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+      },
+    });
+
+  } catch (error) {
+    console.error('Error processing request:', error);
+    const errorMessage = error instanceof Error ? error.message : 'An unknown error occurred';
+    return NextResponse.json({ error: 'Internal Server Error', details: errorMessage }, { status: 500 });
+  }
 }
